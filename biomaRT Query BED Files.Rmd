@@ -1,0 +1,222 @@
+---
+title: "biomaRT Query Bed Files"
+output: html_document
+---
+#reading in the Confenital muscular dystrophy panel from PanelApp and load biomaRt
+```{r}
+MuscD = read.table("Congenital muscular dystrophy.tsv", header=T, sep="\t", fill=T, comment.char = "", quote="")
+```
+
+library(biomaRt)
+#First I selected the data base from Ensembl :Ensembl genes for reference grch37 and saved it to a variable named 'mart_37'
+#then within that data base I specified that I wanted homosapiens genes only.
+
+```{r}
+mart_37 <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", host = "grch37.ensembl.org")
+mart_37 <- useDataset(mart_37, dataset = "hsapiens_gene_ensembl")
+```
+
+#I then query the database using getBM function and I use the attributes to pick which attributes I want returned, for my panel, from mart37. This filers the database using the ensemblIDs from the panel.
+
+```{r}
+MuscD_genes <- getBM(
+  attributes = c("chromosome_name", "start_position", "end_position",
+                 "ensembl_gene_id"),
+  filters = c("ensembl_gene_id"),
+  values =MuscD$EnsemblId.GRch37.,
+  mart = mart_37)
+```
+
+#I convert this into a BED file to create a file ordered based on chromosome name and position.
+
+```{r}
+write.table(MuscD_genes, "Ogpanel.bed", 
+            sep = "\t", quote = F, row.names = F, col.names = F)
+```
+
+#I add attributes for UTR to include UTR start and end positions for all the genes and make another BED 
+
+```{r}
+MuscD_genes_UTR <- getBM(
+  attributes = c("chromosome_name", "start_position", "end_position",
+                 "ensembl_gene_id", "5_utr_start", "5_utr_end",
+                 "3_utr_start", "3_utr_end"),
+  filters = c("ensembl_gene_id"),
+  values =MuscD$EnsemblId.GRch37.,
+  mart = mart_37)
+write.table(MuscD_genes_UTR, "panel.bed", 
+            sep = "\t", quote = F, row.names = F, col.names = F)
+```
+
+#Then I add attributes to include only exon information. 
+```{r}
+MuscD_genes_Exon<- getBM(
+  attributes = c("chromosome_name","exon_chrom_start", "exon_chrom_end",
+                 "ensembl_exon_id"),
+  filters = c("ensembl_gene_id"),
+  values = MuscD$EnsemblId.GRch37.,
+  mart = mart_37)
+```
+
+#To then get the longest exon I add attribute cds length and transcript ID which gives me the coding region length and specifies the different isoforms for the gene and make a BED file for it. 
+
+```{r}
+MuscD_genes_Exon_Length <- getBM(
+  attributes = c("chromosome_name","exon_chrom_start", "exon_chrom_end",
+                 "ensembl_exon_id", "transcript_length", "cds_length", "external_gene_name", "ensembl_transcript_id"),
+  filters = c("ensembl_gene_id"),
+  values = MuscD$EnsemblId.GRch37.,
+  mart = mart_37)
+write.table(MuscD_genes_Exon_Length, "panel_exons.bed", 
+            sep = "\t", quote = F, row.names = F, col.names = F)
+```
+
+
+#using the order function allows me to sort the coding sequence length in ascending order with the longest transcript appearing first
+```{r}
+MuscD_genes_Exon_Length <- MuscD_genes_Exon_Length[order(MuscD_genes_Exon_Length$cds_length, decreasing = T), ]
+```
+
+
+#Then I index this information for only the longest isoform(transcript ID) of the longest coding gene and make a BED file of it. 
+```{r}
+longest <- MuscD_genes_Exon_Length[MuscD_genes_Exon_Length$ensembl_transcript_id=="ENST00000367255", ]
+```
+
+
+
+```{r}
+write.table(MuscD_genes_Exon_Length, "panel_exons_longest_transcript.bed", 
+            sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+#Now I order the transcript length information in descending order to get the shortest transcript at the top.
+
+```{r}
+MuscD_genes_Exon_Length <- MuscD_genes_Exon_Length[order(MuscD_genes_Exon_Length$transcript_length, decreasing = F), ]
+```
+
+#I index based on the transcript ID since the shortest transcript length with a coding sequence has a specific transcript ID.
+
+```{r}
+shortest <- MuscD_genes_Exon_Length[MuscD_genes_Exon_Length$ensembl_transcript_id=="ENST00000448370", ]
+```
+
+
+#Using the get sequence function I can obtain the sequence of the gene based on the transcript ID and create a FASTA file. 
+
+#Specifying seqType for coding allows us to get the coding sequence this is writen to a fasta file in your working directory, first I wrote the header and then appended (with append=T) the sequence to the file with the header:
+```{r}
+seq <- getSequence(id = "ENST00000448370",
+                   type = "ensembl_transcript_id",
+                   seqType = "coding", 
+                   mart = mart_37)
+
+write("> ENST00000448370", "shortest_gene.fasta")
+write(seq$coding, "shortest_gene.fasta", append = T)
+```
+
+
+#next I read the VCF aligned against the hg19 build and check the entire range of rows for variants that pass the quality filter
+```{r}
+vcf <- readVcf("PGPC_0001_S1.flt.subset.vcf", "hg19")
+variants_pass <- rowRanges(vcf)[rowRanges(vcf)$FILTER == "PASS", ]
+length(variants_pass) #42535 variants pass the quality filter
+```
+
+
+#Next I read the bed file back into R 
+```{r}
+panel <- read.table("OGpanel.bed", sep = "\t", 
+                    col.names = c("chr", "start", "end", "geneID"))
+```
+
+
+#Then I filter the BED file based on genomic positions using GRanges and I canuse this range to apply the variant file to my panel
+
+```{r}
+panel_region <- GRanges(seqnames = panel$chr,
+                        ranges = IRanges(start = panel$start,
+                                         end = panel$end,
+                                         names = panel$gene))
+```
+
+
+#This updates the chromosome names from the panel to match the VCF format.
+```{r}
+seqlevelsStyle(panel_region) <- "UCSC"
+```
+
+
+#Next I use bzip to compress the data to a smaller size so I can sort the file from ascending order using indexTabix and it can be indexed overwriting the previously indexed file.  
+
+```{r}
+bgzip("PGPC_0001_S1.flt.subset.vcf", "PGPC_0001_S1.flt.subset.vcf.gz", 
+      overwrite = T)
+indexTabix("PGPC_0001_S1.flt.subset.vcf.gz", format = "vcf")
+```
+
+
+#tabix is an index file form
+
+```{r}
+tbx <- TabixFile("PGPC_0001_S1.flt.subset.vcf.gz")
+```
+
+#next I subset the variants based on the panel regions:
+```{r}
+vcf_subset <- readVcf(tbx, "hg19", param = panel_region)
+```
+
+
+#next put the vcf_subset data into a file
+```{r}
+writeVcf(vcf_subset, "PGPC_0001_S1.flt.subset.vcf")
+```
+
+
+# some entries might have more than one ALT allele possible (separated by commas), so in order to save the output in a table I expand the vcf so each entry has a single ALT allele:
+```{r}
+vcf_subset_expanded <- expand(vcf_subset)
+```
+
+
+# finally I save just the subsetted expanded variants to a tsv file and this file filters the rows for only variants that the quality filter:
+```{r}
+write.table(rowRanges(vcf_subset_expanded)[rowRanges(vcf_subset_expanded)$FILTER == "PASS", ], file = "variants.tsv", 
+            sep = "\t", quote = F, row.names = F)
+```
+
+
+#Next I make shorter names for the minor allele frequency of SNP database and SNP database.   
+```{r}
+mafdb <- MafDb.TOPMed.freeze5.hg19
+```
+
+
+
+#Next I read in my tsv file extract minor allele frequency for the SNPs in my vcf file(based on chromosome name and start position), extracted from the MAF TOPMed database:
+```{r}
+myvariants <- read.table("variants.tsv", header=T)
+snp_pos_maf <- gscores(mafdb, GRanges(myvariants))
+```
+
+
+#I isolate the MAF values alone and reference the column name:
+```{r}
+maf <- snp_pos_maf$AF
+```
+
+
+# Then I filter the results to keep only the rare SNPs. First I removed entries without allele frequency information (NA in the AF column):
+```{r}
+snp_pos_maf_noNA <- snp_pos_maf[!is.na(snp_pos_maf$AF), ]
+snp_pos_maf_uncommon <- snp_pos_maf_noNA[snp_pos_maf_noNA$AF < 0.01, ]
+write.table(snp_pos_maf_common, file = "variants_rare.tsv", 
+            sep = "\t", quote = F, row.names = F)
+```
+
+
+
+
